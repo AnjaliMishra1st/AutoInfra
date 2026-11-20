@@ -1,0 +1,106 @@
+---
+- name: Common setup on all servers
+  hosts: all
+  gather_facts: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Nagios plugins and curl
+      ansible.builtin.apt:
+        name: [monitoring-plugins-basic, monitoring-plugins-standard, curl]
+        state: present
+
+    - name: Install Puppet
+      block:
+        - name: Install puppet-agent
+          ansible.builtin.apt:
+            name: puppet-agent
+            state: present
+      rescue:
+        - name: Fallback - install puppet package
+          ansible.builtin.apt:
+            name: puppet
+            state: present
+
+- name: Configure web servers (Ansible installs, Puppet enforces)
+  hosts: webservers
+  gather_facts: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  tasks:
+    - name: Install Apache
+      ansible.builtin.apt:
+        name: apache2
+        state: present
+
+    - name: Create Puppet directory
+      ansible.builtin.file:
+        path: /opt/puppet
+        state: directory
+        mode: "0755"
+
+    - name: Copy Puppet manifest
+      ansible.builtin.copy:
+        src: files/webserver.pp
+        dest: /opt/puppet/webserver.pp
+        mode: "0644"
+
+    - name: Apply Puppet manifest
+      ansible.builtin.command: puppet apply /opt/puppet/webserver.pp --detailed-exitcodes
+      register: puppet_run
+      changed_when: puppet_run.rc == 2
+      failed_when: puppet_run.rc not in [0, 2]
+      tags: puppet
+
+    - name: Show Puppet result
+      ansible.builtin.debug:
+        var: puppet_run.stdout_lines
+      tags: puppet
+
+- name: Configure monitoring server (Nagios)
+  hosts: monitoring
+  gather_facts: false
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  tasks:
+    - name: Install Nagios and Apache
+      ansible.builtin.apt:
+        name: [nagios4, apache2]
+        state: present
+
+    - name: Allow ping for non-root users
+      ansible.builtin.file:
+        path: /usr/bin/ping
+        mode: "u+s"
+
+    - name: Deploy Nagios configuration
+      ansible.builtin.template:
+        src: templates/devops_nagios.cfg.j2
+        dest: /etc/nagios4/conf.d/devops.cfg
+        mode: "0644"
+
+    - name: Create dashboard login (nagiosadmin / admin123)
+      ansible.builtin.shell: |
+        HASH=$(printf 'nagiosadmin:Nagios4:admin123' | md5sum | cut -d' ' -f1)
+        echo "nagiosadmin:Nagios4:${HASH}" > /etc/nagios4/htdigest.users
+        chmod 640 /etc/nagios4/htdigest.users
+        chgrp www-data /etc/nagios4/htdigest.users
+      args:
+        executable: /bin/bash
+
+    - name: Enable Apache modules for the Nagios dashboard
+      ansible.builtin.shell: a2enmod auth_digest authz_groupfile cgi || true
+      changed_when: false
+
+    - name: Verify Nagios configuration
+      ansible.builtin.command: /usr/sbin/nagios4 -v /etc/nagios4/nagios.cfg
+      changed_when: false
+
+    - name: Restart Nagios and Apache
+      ansible.builtin.command: "service {{ item }} restart"
+      loop: [nagios4, apache2]
